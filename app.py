@@ -10,7 +10,7 @@ class NubankUltraParser:
     def __init__(self):
         # Regex para datas: "02 OUT 2025" ou "02 OUT"
         self.date_pattern = re.compile(r'^\d{2}\s[A-Z]{3}')
-        # Palavras para ignorar (sujeira de rodapé/institucional e totalizadores)
+        # Palavras para ignorar (sujeira de rodapé e totalizadores que confundem a contagem)
         self.blacklist = [
             "atendimento", "ouvidoria", "mande uma mensagem", "duvida", "ligue", 
             "gerado dia", "nubank.com.br", "total de entradas", "total de saídas",
@@ -19,7 +19,6 @@ class NubankUltraParser:
 
     def clean_val(self, val_str):
         if not val_str: return 0.0
-        # Remove R$, espaços e ajusta pontuação brasileira
         clean = re.sub(r'[^0-9,\.\-]', '', str(val_str))
         if ',' in clean:
             clean = clean.replace('.', '').replace(',', '.')
@@ -35,30 +34,37 @@ class NubankUltraParser:
                 words = page.extract_words(keep_blank_chars=True, y_tolerance=3)
                 
                 current_tx = None
+                last_seen_date = "" # Armazena a data para repetir em múltiplos lançamentos
+                
                 for w in words:
                     text = w['text'].strip()
                     x0 = w['x0']
                     text_lower = text.lower()
                     
-                    # CORREÇÃO 1: Ignora rodapé, institucionais e também os "TOTAIS" do dia
+                    # Ignora rodapé, institucionais e totais do dia
                     if any(word in text_lower for word in self.blacklist):
                         continue
-                    
-                    # CORREÇÃO 2: Ignora o padrão "X de Y" (ex: 4 de 11) que aparece no rodapé
                     if re.match(r'^\d+\sde\s\d+$', text):
                         continue
 
-                    # 1. Detecta Início de Transação pela Data
+                    # 1. Atualiza a data atual se encontrar uma nova
                     if self.date_pattern.match(text):
-                        if current_tx: extracted_rows.append(current_tx)
-                        current_tx = {"Data": text, "Historico": "", "Valor_Raw": "", "Pagina": page.page_number}
+                        last_seen_date = text
+                        # Se já existia uma transação sendo montada, salva ela antes de começar a nova
+                        if current_tx and (current_tx["Historico"] or current_tx["Valor_Raw"]):
+                            extracted_rows.append(current_tx)
+                        current_tx = {"Data": last_seen_date, "Historico": "", "Valor_Raw": "", "Pagina": page.page_number}
                     
                     elif current_tx:
-                        # 2. Detecta Valor (Foca na coluna da direita)
-                        # Aumentei levemente para x0 > 400 para focar nas transações individuais e ignorar o centro
+                        # 2. SE encontrar um valor (x0 > 400) e a transação atual JÁ TIVER um valor,
+                        # significa que começou uma NOVA transação na mesma data.
                         if x0 > 400 and (',' in text or text.startswith('+') or text.startswith('-')):
-                            if not ('.' in current_tx["Valor_Raw"] or ',' in current_tx["Valor_Raw"]):
-                                current_tx["Valor_Raw"] += text
+                            if current_tx["Valor_Raw"] != "":
+                                extracted_rows.append(current_tx)
+                                # Cria nova linha aproveitando a última data vista
+                                current_tx = {"Data": last_seen_date, "Historico": "", "Valor_Raw": text, "Pagina": page.page_number}
+                            else:
+                                current_tx["Valor_Raw"] = text
                         else:
                             # 3. Acumula Histórico
                             if len(text) > 1 and text_lower not in ["total", "entradas", "saídas", "de"]:
@@ -73,7 +79,6 @@ class NubankUltraParser:
         if df.empty: return df
         
         df['Historico'] = df['Historico'].astype(str).str.strip()
-        # Remove linhas que acabaram ficando sem histórico ou valor após os filtros
         df = df[df['Historico'] != ""]
         
         df['Valor_Final'] = df['Valor_Raw'].apply(self.clean_val)
