@@ -8,9 +8,7 @@ st.set_page_config(page_title="Conversor Profissional - Vitor", layout="wide")
 
 class NubankUltraParser:
     def __init__(self):
-        # Regex para datas: "02 OUT 2025" ou "02 OUT"
         self.date_pattern = re.compile(r'^\d{2}\s[A-Z]{3}')
-        # Lista de bloqueio rigorosa para evitar que totais e rodapés virem linhas
         self.blacklist = [
             "atendimento", "ouvidoria", "mande uma mensagem", "duvida", "ligue", 
             "gerado dia", "nubank.com.br", "total de entradas", "total de saídas",
@@ -19,6 +17,7 @@ class NubankUltraParser:
 
     def clean_val(self, val_str):
         if not val_str: return 0.0
+        # Remove tudo que não é número ou vírgula/ponto
         clean = re.sub(r'[^0-9,\.]', '', str(val_str))
         if ',' in clean:
             clean = clean.replace('.', '').replace(',', '.')
@@ -41,13 +40,18 @@ class NubankUltraParser:
                     x0, y0 = w['x0'], w['top']
                     text_lower = text.lower()
                     
-                    # BLOQUEIO CRÍTICO: Se a palavra ou frase estiver na blacklist, ignora o processamento dela
-                    if any(word in text_lower for word in self.blacklist):
-                        continue
-                    if re.match(r'^\d+\sde\s\d+$', text): # Ignora "1 de 11", "2 de 11", etc.
+                    # 1. BLOQUEIO DE SINAL: Se o texto contém + ou - junto com números, ignore.
+                    # Isso mata os totais (+48,50 ou -414,48) na origem.
+                    if (text.startswith('+') or text.startswith('-')) and any(c.isdigit() for c in text):
                         continue
 
-                    # 1. Detecta Data
+                    # 2. BLOQUEIO DE TEXTO INSTITUCIONAL
+                    if any(word in text_lower for word in self.blacklist):
+                        continue
+                    if re.match(r'^\d+\sde\s\d+$', text):
+                        continue
+
+                    # 3. DETECTA DATA
                     if self.date_pattern.match(text):
                         last_seen_date = text
                         if current_tx: extracted_rows.append(current_tx)
@@ -55,9 +59,8 @@ class NubankUltraParser:
                         last_y = 0
                     
                     elif current_tx:
-                        # 2. Detecta Valor Individual (Coluna Direita)
+                        # 4. DETECTA VALOR (Apenas números limpos na direita)
                         if ',' in text and any(c.isdigit() for c in text) and x0 > 400:
-                            # Só processa se não for na mesma altura (Y) do valor anterior (evita ler agência como valor)
                             if abs(y0 - last_y) > 5: 
                                 val = self.clean_val(text)
                                 
@@ -65,16 +68,15 @@ class NubankUltraParser:
                                     extracted_rows.append(current_tx)
                                     current_tx = {"Data": last_seen_date, "Historico": "", "Entrada": 0.0, "Saida": 0.0, "Pagina": page.page_number}
                                 
-                                # Classifica baseado no histórico acumulado até agora
                                 h_low = current_tx["Historico"].lower()
-                                if any(x in h_low for x in ["pagamento", "compra", "enviada", "saída", "débito", "fatura"]):
+                                if any(x in h_low for x in ["pagamento", "compra", "enviada", "saída", "débito", "fatura", "enviado"]):
                                     current_tx["Saida"] = val
                                 else:
                                     current_tx["Entrada"] = val
                                 
                                 last_y = y0 
                         else:
-                            # 3. Acumula Histórico
+                            # 5. ACUMULA HISTÓRICO
                             if len(text) > 1:
                                 current_tx["Historico"] += f" {text}"
                 
@@ -86,9 +88,7 @@ class NubankUltraParser:
         df = pd.DataFrame(rows)
         if df.empty: return df
         df['Historico'] = df['Historico'].astype(str).str.strip()
-        # Garante que não fiquem linhas vazias ou apenas com espaços
-        df = df[df['Historico'].str.len() > 2]
-        # Drop de duplicatas residuais por segurança
+        df = df[df['Historico'].str.len() > 3]
         df = df.drop_duplicates(subset=['Data', 'Historico', 'Entrada', 'Saida'])
         return df[["Data", "Historico", "Entrada", "Saida", "Pagina"]]
 
