@@ -8,7 +8,6 @@ st.set_page_config(page_title="Conversor Profissional - Vitor", layout="wide")
 
 class NubankUltraParser:
     def __init__(self):
-        # Regex para datas: "02 OUT 2025" ou "02 OUT" [cite: 11, 24]
         self.date_pattern = re.compile(r'^\d{2}\s[A-Z]{3}')
         self.blacklist = [
             "atendimento", "ouvidoria", "mande uma mensagem", "duvida", "ligue", 
@@ -29,42 +28,47 @@ class NubankUltraParser:
         extracted_rows = []
         with pdfplumber.open(pdf_file) as pdf:
             for page in pdf.pages:
-                # Extrai palavras mantendo a noção de linha (y_tolerance) [cite: 44, 103]
                 words = page.extract_words(keep_blank_chars=True, y_tolerance=3)
                 
                 current_tx = None
                 last_seen_date = ""
+                last_y = 0 # Guarda a altura da última captura de valor
                 
                 for w in words:
                     text = w['text'].strip()
-                    x0 = w['x0']
+                    x0, y0 = w['x0'], w['top'] # Pega posição horizontal e vertical
                     text_lower = text.lower()
                     
                     if any(word in text_lower for word in self.blacklist): continue
                     if re.match(r'^\d+\sde\s\d+$', text): continue
 
-                    # 1. Detecta Data e reinicia a transação
+                    # 1. Detecta Data
                     if self.date_pattern.match(text):
                         last_seen_date = text
                         if current_tx: extracted_rows.append(current_tx)
                         current_tx = {"Data": last_seen_date, "Historico": "", "Entrada": 0.0, "Saida": 0.0, "Pagina": page.page_number}
+                        last_y = 0
                     
                     elif current_tx:
-                        # 2. Se encontrar um valor (x0 > 400), verifica se já existe um valor na linha atual
+                        # 2. Detecta Valor (Coluna Direita)
                         if ',' in text and any(c.isdigit() for c in text) and x0 > 400:
-                            val = self.clean_val(text)
-                            
-                            # Se a transação atual já tem um valor, salva e começa outra na mesma data
-                            if current_tx["Entrada"] > 0 or current_tx["Saida"] > 0:
-                                extracted_rows.append(current_tx)
-                                current_tx = {"Data": last_seen_date, "Historico": "", "Entrada": 0.0, "Saida": 0.0, "Pagina": page.page_number}
-                            
-                            # Classificação por histórico [cite: 31, 150]
-                            h_low = current_tx["Historico"].lower()
-                            if any(x in h_low for x in ["pagamento", "compra", "enviada", "saída", "débito", "fatura"]):
-                                current_tx["Saida"] = val
-                            else:
-                                current_tx["Entrada"] = val
+                            # CORREÇÃO CRUCIAL: Só aceita se for uma nova linha vertical (y0 diferente de last_y)
+                            if abs(y0 - last_y) > 5: 
+                                val = self.clean_val(text)
+                                
+                                # Se a transação já tem valor e mudou a altura, abre uma nova
+                                if (current_tx["Entrada"] > 0 or current_tx["Saida"] > 0):
+                                    extracted_rows.append(current_tx)
+                                    current_tx = {"Data": last_seen_date, "Historico": "", "Entrada": 0.0, "Saida": 0.0, "Pagina": page.page_number}
+                                
+                                # Classifica
+                                h_low = current_tx["Historico"].lower()
+                                if any(x in h_low for x in ["pagamento", "compra", "enviada", "saída", "débito", "fatura"]):
+                                    current_tx["Saida"] = val
+                                else:
+                                    current_tx["Entrada"] = val
+                                
+                                last_y = y0 # Registra a altura onde o valor foi encontrado
                         else:
                             # 3. Acumula Histórico
                             if len(text) > 1:
@@ -78,9 +82,8 @@ class NubankUltraParser:
         df = pd.DataFrame(rows)
         if df.empty: return df
         df['Historico'] = df['Historico'].astype(str).str.strip()
-        # Remove linhas sem histórico útil
         df = df[df['Historico'].str.len() > 2]
-        # Remove duplicatas exatas de leitura (mesma data, histórico e valores)
+        # Limpeza final de duplicatas residuais
         df = df.drop_duplicates(subset=['Data', 'Historico', 'Entrada', 'Saida'])
         return df[["Data", "Historico", "Entrada", "Saida", "Pagina"]]
 
