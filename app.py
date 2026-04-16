@@ -8,9 +8,7 @@ st.set_page_config(page_title="Conversor Profissional - Vitor", layout="wide")
 
 class NubankUltraParser:
     def __init__(self):
-        # Regex para datas: "02 OUT 2025" ou "02 OUT"
         self.date_pattern = re.compile(r'^\d{2}\s[A-Z]{3}')
-        # Palavras para ignorar (sujeira de rodapé e totalizadores que confundem a contagem)
         self.blacklist = [
             "atendimento", "ouvidoria", "mande uma mensagem", "duvida", "ligue", 
             "gerado dia", "nubank.com.br", "total de entradas", "total de saídas",
@@ -34,39 +32,39 @@ class NubankUltraParser:
                 words = page.extract_words(keep_blank_chars=True, y_tolerance=3)
                 
                 current_tx = None
-                last_seen_date = "" # Armazena a data para repetir em múltiplos lançamentos
+                last_seen_date = ""
+                last_val_added = None # Trava para duplicados
                 
                 for w in words:
                     text = w['text'].strip()
                     x0 = w['x0']
                     text_lower = text.lower()
                     
-                    # Ignora rodapé, institucionais e totais do dia
                     if any(word in text_lower for word in self.blacklist):
                         continue
                     if re.match(r'^\d+\sde\s\d+$', text):
                         continue
 
-                    # 1. Atualiza a data atual se encontrar uma nova
                     if self.date_pattern.match(text):
                         last_seen_date = text
-                        # Se já existia uma transação sendo montada, salva ela antes de começar a nova
                         if current_tx and (current_tx["Historico"] or current_tx["Valor_Raw"]):
                             extracted_rows.append(current_tx)
                         current_tx = {"Data": last_seen_date, "Historico": "", "Valor_Raw": "", "Pagina": page.page_number}
+                        last_val_added = None # Reseta a trava ao mudar de data
                     
                     elif current_tx:
-                        # 2. SE encontrar um valor (x0 > 400) e a transação atual JÁ TIVER um valor,
-                        # significa que começou uma NOVA transação na mesma data.
                         if x0 > 400 and (',' in text or text.startswith('+') or text.startswith('-')):
-                            if current_tx["Valor_Raw"] != "":
-                                extracted_rows.append(current_tx)
-                                # Cria nova linha aproveitando a última data vista
-                                current_tx = {"Data": last_seen_date, "Historico": "", "Valor_Raw": text, "Pagina": page.page_number}
-                            else:
-                                current_tx["Valor_Raw"] = text
+                            val_limpo = self.clean_val(text)
+                            
+                            # CORREÇÃO: Só adiciona se o valor for diferente do último ou se o histórico mudou
+                            if val_limpo != last_val_added or current_tx["Valor_Raw"] == "":
+                                if current_tx["Valor_Raw"] != "":
+                                    extracted_rows.append(current_tx)
+                                    current_tx = {"Data": last_seen_date, "Historico": "", "Valor_Raw": text, "Pagina": page.page_number}
+                                else:
+                                    current_tx["Valor_Raw"] = text
+                                last_val_added = val_limpo
                         else:
-                            # 3. Acumula Histórico
                             if len(text) > 1 and text_lower not in ["total", "entradas", "saídas", "de"]:
                                 current_tx["Historico"] += f" {text}"
                 
@@ -77,18 +75,14 @@ class NubankUltraParser:
     def process_to_df(self, rows):
         df = pd.DataFrame(rows)
         if df.empty: return df
-        
         df['Historico'] = df['Historico'].astype(str).str.strip()
         df = df[df['Historico'] != ""]
-        
         df['Valor_Final'] = df['Valor_Raw'].apply(self.clean_val)
-        
         df['Entrada'] = df.apply(lambda r: r['Valor_Final'] if '+' in r['Valor_Raw'] or r['Valor_Final'] > 0 else 0, axis=1)
         df['Saida'] = df.apply(lambda r: abs(r['Valor_Final']) if '-' in r['Valor_Raw'] or r['Valor_Final'] < 0 else 0, axis=1)
-        
         return df[["Data", "Historico", "Entrada", "Saida", "Pagina"]]
 
-# --- Interface ---
+# --- Interface (Mantida Igual) ---
 st.title("🏦 Conversor de Extratos Profissional")
 
 if 'data' not in st.session_state: st.session_state.data = None
