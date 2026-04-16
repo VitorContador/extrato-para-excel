@@ -8,7 +8,9 @@ st.set_page_config(page_title="Conversor Profissional - Vitor", layout="wide")
 
 class NubankUltraParser:
     def __init__(self):
+        # Regex para datas
         self.date_pattern = re.compile(r'^\d{2}\s[A-Z]{3}')
+        # Blacklist para ignorar totais e rodapés
         self.blacklist = [
             "atendimento", "ouvidoria", "mande uma mensagem", "duvida", "ligue", 
             "gerado dia", "nubank.com.br", "total de entradas", "total de saídas",
@@ -27,86 +29,77 @@ class NubankUltraParser:
         extracted_rows = []
         with pdfplumber.open(pdf_file) as pdf:
             for page in pdf.pages:
-                # O segredo: Extrair palavras agrupadas por linha (Y)
                 words = page.extract_words(keep_blank_chars=True, y_tolerance=3)
                 
-                # Agrupamos as palavras que estão na mesma altura (top)
-                lines = {}
-                for w in words:
-                    y = round(w['top'], 0)
-                    if y not in lines: lines[y] = []
-                    lines[y].append(w)
-                
+                current_tx = None
                 last_seen_date = ""
+                last_y = 0
                 
-                # Processamos linha por linha da página
-                for y in sorted(lines.keys()):
-                    line_words = sorted(lines[y], key=lambda x: x['x0'])
-                    line_text = " ".join([w['text'] for w in line_words]).strip()
-                    line_text_lower = line_text.lower()
+                for w in words:
+                    text = w['text'].strip()
+                    x0, y0 = w['x0'], w['top']
+                    text_lower = text.lower()
                     
-                    # Filtros de segurança
-                    if any(word in line_text_lower for word in self.blacklist): continue
-                    if (line_text.startswith('+') or line_text.startswith('-')) and any(c.isdigit() for c in line_text): continue
-                    if re.match(r'^\d+\sde\s\d+$', line_text): continue
+                    # 1. BLOQUEIO DE TOTAIS E RODAPÉ (Pelo sinal e palavras)
+                    if (text.startswith('+') or text.startswith('-')) and any(c.isdigit() for c in text): continue
+                    if any(word in text_lower for word in self.blacklist): continue
+                    if re.match(r'^\d+\sde\s\d+$', text): continue
 
-                    # 1. Se a linha tem data, atualizamos a data de referência
-                    date_match = self.date_pattern.match(line_text)
-                    if date_match:
-                        last_seen_date = date_match.group()
+                    # 2. DETECTA DATA
+                    if self.date_pattern.match(text):
+                        last_seen_date = text
+                        if current_tx: extracted_rows.append(current_tx)
+                        current_tx = {"Data": last_seen_date, "Historico": "", "Entrada": 0.0, "Saida": 0.0, "Pagina": page.page_number}
+                        last_y = 0
                     
-                    # 2. Identifica se a linha tem um valor na direita (Coluna de Valor)
-                    val_text = ""
-                    hist_text = ""
-                    
-                    for w in line_words:
-                        if w['x0'] > 400 and ',' in w['text'] and any(c.isdigit() for c in w['text']):
-                            val_text = w['text']
+                    elif current_tx:
+                        # 3. DETECTA VALOR (Direita)
+                        if ',' in text and any(c.isdigit() for c in text) and x0 > 400:
+                            # Se a diferença de altura for relevante, é um novo valor
+                            if abs(y0 - last_y) > 5: 
+                                val = self.clean_val(text)
+                                # Se a transação já tinha valor, fecha e abre outra na mesma data
+                                if current_tx["Entrada"] > 0 or current_tx["Saida"] > 0:
+                                    extracted_rows.append(current_tx)
+                                    current_tx = {"Data": last_seen_date, "Historico": "", "Entrada": 0.0, "Saida": 0.0, "Pagina": page.page_number}
+                                
+                                # Classifica por palavras-chave
+                                h_low = current_tx["Historico"].lower()
+                                if any(x in h_low for x in ["pagamento", "compra", "enviada", "saída", "débito", "fatura", "enviado"]):
+                                    current_tx["Saida"] = val
+                                else:
+                                    current_tx["Entrada"] = val
+                                last_y = y0
                         else:
-                            # Evita repetir a data no histórico
-                            t = w['text']
-                            if not self.date_pattern.match(t):
-                                hist_text += f" {t}"
-                    
-                    # 3. Se achamos um valor, criamos o lançamento com o histórico daquela MESMA linha
-                    if val_text and last_seen_date:
-                        val_num = self.clean_val(val_text)
-                        h_low = hist_text.lower()
-                        
-                        entrada, saida = 0.0, 0.0
-                        if any(x in h_low for x in ["pagamento", "compra", "enviada", "saída", "débito", "fatura", "enviado"]):
-                            saida = val_num
-                        else:
-                            entrada = val_num
-                            
-                        extracted_rows.append({
-                            "Data": last_seen_date,
-                            "Historico": hist_text.strip(),
-                            "Entrada": entrada,
-                            "Saida": saida,
-                            "Pagina": page.page_number
-                        })
+                            # 4. ACUMULA HISTÓRICO
+                            if len(text) > 1:
+                                current_tx["Historico"] += f" {text}"
+                
+                if current_tx: extracted_rows.append(current_tx)
         
         return self.process_to_df(extracted_rows)
 
     def process_to_df(self, rows):
         df = pd.DataFrame(rows)
         if df.empty: return df
-        # Limpa históricos que ficaram apenas com "Total" ou sujeira
+        df['Historico'] = df['Historico'].astype(str).str.strip()
+        # Filtro final para garantir que não temos linhas vazias
         df = df[df['Historico'].str.len() > 3]
         return df[["Data", "Historico", "Entrada", "Saida", "Pagina"]]
 
 # --- Interface ---
 st.title("🏦 Conversor de Extratos Profissional")
 
+# Inicializa o estado para não perder os dados no rerun
 if 'data' not in st.session_state: st.session_state.data = None
 if 'history' not in st.session_state: st.session_state.history = []
 
 file = st.file_uploader("Arraste o extrato aqui", type="pdf")
 
 if file and st.session_state.data is None:
+    # Processamento único
     st.session_state.data = NubankUltraParser().parse(file)
-    st.session_state.history.append(st.session_state.data.copy())
+    st.session_state.history = [st.session_state.data.copy()]
 
 if st.session_state.data is not None:
     if st.button("⬅️ Desfazer Alteração"):
@@ -115,8 +108,10 @@ if st.session_state.data is not None:
             st.session_state.data = st.session_state.history[-1].copy()
             st.rerun()
 
+    # Editor de dados
     edited = st.data_editor(st.session_state.data, use_container_width=True, num_rows="dynamic")
 
+    # Salva no histórico se houver mudança manual
     if not edited.equals(st.session_state.data):
         st.session_state.history.append(edited.copy())
         st.session_state.data = edited
