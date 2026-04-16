@@ -8,12 +8,12 @@ st.set_page_config(page_title="Conversor de Extrato", layout="wide")
 
 class BaseParser:
     def __init__(self):
-        # Aceita datas: 02 OUT 2025, 02/10/2025, 02/10
+        # Regex para datas (02 OUT 2025, 02/10/2025, etc)
         self.date_pattern = re.compile(r'^(\d{2}/\d{2}/\d{4}|\d{2}/\d{2}|\d{2}\s[A-Z]{3})')
     
     def clean_value(self, value_str):
         if not value_str: return 0.0
-        # Remove R$, espaços e ajusta pontuação brasileira
+        # Limpa R$, espaços e ajusta pontos/vírgulas
         val = str(value_str).replace('R$', '').replace(' ', '').strip()
         if ',' in val:
             val = val.replace('.', '').replace(',', '.')
@@ -30,7 +30,7 @@ class GenericParser(BaseParser):
         all_data = []
         with pdfplumber.open(pdf_path) as pdf:
             for page in pdf.pages:
-                words = page.extract_words(keep_blank_chars=True, y_tolerance=3, x_tolerance=3)
+                words = page.extract_words(keep_blank_chars=True, y_tolerance=3, x_tolerance=2)
                 if not words: continue
                 
                 current_row = None
@@ -41,10 +41,10 @@ class GenericParser(BaseParser):
                         if current_row: all_data.append(current_row)
                         current_row = {"Data": text, "Historico": "", "Valor": "", "Pagina": page.page_number}
                     elif current_row:
-                        # Se o texto tem número e vírgula, tratamos como potencial valor
-                        # Reduzi o x0 para 250 para pegar colunas mais centrais se necessário
+                        # Se tem número e vírgula, ou sinal de menos, tratamos como valor
+                        # Baixei o x0 para 200 para garantir que pegue colunas centrais
                         is_numeric = any(char.isdigit() for char in text) and ',' in text
-                        if x0 > 250 and (is_numeric or 'R$' in text or '-' in text):
+                        if x0 > 200 and (is_numeric or 'R$' in text or (text.startswith('-') and len(text) > 1)):
                             current_row["Valor"] += f" {text}"
                         else:
                             current_row["Historico"] += f" {text}"
@@ -55,24 +55,35 @@ class GenericParser(BaseParser):
     def post_process(self, data):
         df = pd.DataFrame(data)
         if df.empty: return df
-        df['Historico'] = df['Historico'].str.replace('Total de entradas', '').replace('Total de saídas', '').strip()
+        
+        # CORREÇÃO DO ERRO: Primeiro garantimos que a coluna é String, depois limpamos
+        df['Historico'] = df['Historico'].astype(str).str.replace('Total de entradas', '', case=False)
+        df['Historico'] = df['Historico'].str.replace('Total de saídas', '', case=False).str.strip()
+        
         df['Valor_Num'] = df['Valor'].apply(self.clean_value)
-        # Se o valor for 0 mas tiver algo no campo Valor, tentamos uma limpeza extra
-        return df[["Data", "Historico", "Valor_Num", "Pagina"]]
+        
+        # Criando colunas de Entrada e Saída para facilitar sua vida
+        df['Entrada'] = df['Valor_Num'].apply(lambda x: x if x > 0 else 0)
+        df['Saida'] = df['Valor_Num'].apply(lambda x: abs(x) if x < 0 else 0)
+        
+        return df[["Data", "Historico", "Entrada", "Saida", "Valor_Num", "Pagina"]]
 
 st.title("🏦 Conversor de Extrato Bancário")
 uploaded_file = st.file_uploader("Arraste o PDF aqui", type="pdf")
 
 if uploaded_file:
-    with st.spinner('Processando...'):
+    with st.spinner('Processando extrato...'):
         parser = GenericParser()
         df = parser.parse(uploaded_file)
         if not df.empty:
-            st.success(f"Lançamentos processados: {len(df)}")
-            # O data_editor permite que você ajuste valores manualmente se algum falhar
+            st.success(f"Encontramos {len(df)} lançamentos!")
+            # O data_editor permite que você corrija qualquer valor na hora
             edited_df = st.data_editor(df, use_container_width=True, num_rows="dynamic")
             
             output_excel = BytesIO()
             with pd.ExcelWriter(output_excel, engine='openpyxl') as writer:
                 edited_df.to_excel(writer, index=False)
-            st.download_button("📥 Baixar Excel", output_excel.getvalue(), "extrato_vitor.xlsx")
+            
+            st.download_button("📥 Baixar Excel Completo", output_excel.getvalue(), "extrato_vitor_corrigido.xlsx")
+        else:
+            st.error("Nenhum dado encontrado. Verifique se o PDF é digital.")
