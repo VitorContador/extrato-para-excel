@@ -6,23 +6,19 @@ from io import BytesIO
 
 st.set_page_config(page_title="Conversor Profissional - Vitor", layout="wide")
 
-class NubankUltraParser:
+class NubankDetailParser:
     def __init__(self):
-        # Regex para datas: "02 OUT 2025" ou "02 OUT"
         self.date_pattern = re.compile(r'^\d{2}\s[A-Z]{3}')
-        # Palavras para ignorar (sujeira de rodapé/institucional)
-        self.blacklist = ["atendimento", "ouvidoria", "mande uma mensagem", "duvida", "ligue", "gerado dia", "nubank.com.br"]
+        # Palavras que indicam resumo e devem ser ignoradas para evitar duplicidade
+        self.summary_keywords = ["total de entradas", "total de saídas", "saldo final", "rendimento líquido"]
+        self.blacklist = ["atendimento", "ouvidoria", "mande uma mensagem", "ligue", "gerado dia", "1 de", "2 de"]
 
     def clean_val(self, val_str):
         if not val_str: return 0.0
-        # Remove R$, espaços e ajusta pontuação brasileira
         clean = re.sub(r'[^0-9,\.\-]', '', str(val_str))
         if ',' in clean:
             clean = clean.replace('.', '').replace(',', '.')
-        try: 
-            # Garante apenas 2 casas decimais para evitar "grudar" com número de página
-            val = float(clean)
-            return round(val, 2)
+        try: return round(float(clean), 2)
         except: return 0.0
 
     def parse(self, pdf_file):
@@ -32,30 +28,38 @@ class NubankUltraParser:
                 words = page.extract_words(keep_blank_chars=True, y_tolerance=3)
                 
                 current_tx = None
+                last_date = ""
+
                 for w in words:
                     text = w['text'].strip()
                     x0 = w['x0']
-                    
-                    # Ignora linhas de rodapé
-                    if any(word in text.lower() for word in self.blacklist):
+                    text_lower = text.lower()
+
+                    # 1. Filtro de Segurança: Ignora rodapés e resumos do dia
+                    if any(key in text_lower for key in self.summary_keywords + self.blacklist):
                         continue
 
-                    # 1. Detecta Início de Transação pela Data
+                    # 2. Detecta Data ou Novo Lançamento
+                    # Se encontrarmos uma data, atualizamos a 'data atual'
                     if self.date_pattern.match(text):
+                        last_date = text
                         if current_tx: extracted_rows.append(current_tx)
-                        current_tx = {"Data": text, "Historico": "", "Valor_Raw": "", "Pagina": page.page_number}
+                        current_tx = {"Data": last_date, "Historico": "", "Valor_Raw": "", "Pagina": page.page_number}
                     
                     elif current_tx:
-                        # 2. Detecta Valor (Foca na coluna da direita e ignora números isolados pequenos)
-                        # No Nubank, valores reais com centavos sempre tem vírgula
-                        if x0 > 380 and (',' in text or text.startswith('+') or text.startswith('-')):
-                            # Se o valor já tem centavos, não deixa grudar mais nada (evita número de página)
-                            if not ('.' in current_tx["Valor_Raw"] or ',' in current_tx["Valor_Raw"]):
-                                current_tx["Valor_Raw"] += text
+                        # 3. Detecta Valor Individual (Coluna da direita e com vírgula)
+                        # No Nubank, transações individuais não costumam ter o sinal de + na frente, 
+                        # enquanto o resumo tem. Isso ajuda a filtrar.
+                        if x0 > 400 and (',' in text):
+                            # Se já temos um valor para esse histórico, salvamos e abrimos outro (para casos de várias transações sob a mesma data)
+                            if current_tx["Valor_Raw"] != "":
+                                extracted_rows.append(current_tx)
+                                current_tx = {"Data": last_date, "Historico": "", "Valor_Raw": text, "Pagina": page.page_number}
+                            else:
+                                current_tx["Valor_Raw"] = text
                         else:
-                            # 3. Acumula Histórico (Evita frases institucionais)
-                            if len(text) > 1 and text not in ["Total", "entradas", "saídas", "de"]:
-                                current_tx["Historico"] += f" {text}"
+                            # 4. Acumula Histórico
+                            current_tx["Historico"] += f" {text}"
                 
                 if current_tx: extracted_rows.append(current_tx)
         
@@ -65,43 +69,45 @@ class NubankUltraParser:
         df = pd.DataFrame(rows)
         if df.empty: return df
         
+        # Limpeza de campos
         df['Historico'] = df['Historico'].astype(str).str.strip()
+        df = df[df['Historico'] != ""] # Remove linhas fantasmas
+        
         df['Valor_Final'] = df['Valor_Raw'].apply(self.clean_val)
         
-        # Identifica sinal pelo texto bruto
-        df['Entrada'] = df.apply(lambda r: r['Valor_Final'] if '+' in r['Valor_Raw'] or r['Valor_Final'] > 0 else 0, axis=1)
-        df['Saida'] = df.apply(lambda r: abs(r['Valor_Final']) if '-' in r['Valor_Raw'] or r['Valor_Final'] < 0 else 0, axis=1)
+        # No Nubank detalhado, o sinal negativo (-) costuma acompanhar o valor da saída
+        df['Entrada'] = df.apply(lambda r: r['Valor_Final'] if '-' not in r['Valor_Raw'] else 0, axis=1)
+        df['Saida'] = df.apply(lambda r: abs(r['Valor_Final']) if '-' in r['Valor_Raw'] else 0, axis=1)
         
-        return df[["Data", "Historico", "Entrada", "Saida", "Pagina"]]
+        return df[["Data", "Historico", "Entrada", "Saida"]]
 
 # --- Interface ---
-st.title("🏦 Conversor Nubank Premium")
+st.title("🏦 Conversor Nubank (Modo Detalhado)")
 
 if 'data' not in st.session_state: st.session_state.data = None
 if 'history' not in st.session_state: st.session_state.history = []
 
-file = st.file_uploader("Arraste o extrato aqui", type="pdf")
+file = st.file_uploader("Suba o extrato para processar os itens individuais", type="pdf")
 
-if file and st.session_state.data is None:
-    st.session_state.data = NubankUltraParser().parse(file)
-    st.session_state.history.append(st.session_state.data.copy())
+if file:
+    if st.button("🚀 Processar Extrato"):
+        st.session_state.data = NubankDetailParser().parse(file)
+        st.session_state.history = [st.session_state.data.copy()]
 
 if st.session_state.data is not None:
-    if st.button("⬅️ Desfazer (Ctrl+Z)"):
+    if st.button("⬅️ Desfazer Alteração"):
         if len(st.session_state.history) > 1:
             st.session_state.history.pop()
             st.session_state.data = st.session_state.history[-1].copy()
             st.rerun()
 
-    # Tabela editável
     edited = st.data_editor(st.session_state.data, use_container_width=True, num_rows="dynamic")
 
     if not edited.equals(st.session_state.data):
         st.session_state.history.append(edited.copy())
         st.session_state.data = edited
 
-    # Exportação
     xlsx = BytesIO()
     with pd.ExcelWriter(xlsx, engine='openpyxl') as writer:
         edited.to_excel(writer, index=False)
-    st.download_button("📥 Baixar Planilha Limpa", xlsx.getvalue(), "extrato_limpo.xlsx")
+    st.download_button("📥 Baixar Excel Detalhado", xlsx.getvalue(), "extrato_detalhado.xlsx")
