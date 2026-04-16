@@ -8,7 +8,9 @@ st.set_page_config(page_title="Conversor Profissional - Vitor", layout="wide")
 
 class NubankUltraParser:
     def __init__(self):
+        # Regex para datas: "02 OUT 2025" ou "02 OUT"
         self.date_pattern = re.compile(r'^\d{2}\s[A-Z]{3}')
+        # Lista de bloqueio rigorosa para evitar que totais e rodapés virem linhas
         self.blacklist = [
             "atendimento", "ouvidoria", "mande uma mensagem", "duvida", "ligue", 
             "gerado dia", "nubank.com.br", "total de entradas", "total de saídas",
@@ -32,15 +34,18 @@ class NubankUltraParser:
                 
                 current_tx = None
                 last_seen_date = ""
-                last_y = 0 # Guarda a altura da última captura de valor
+                last_y = 0 
                 
                 for w in words:
                     text = w['text'].strip()
-                    x0, y0 = w['x0'], w['top'] # Pega posição horizontal e vertical
+                    x0, y0 = w['x0'], w['top']
                     text_lower = text.lower()
                     
-                    if any(word in text_lower for word in self.blacklist): continue
-                    if re.match(r'^\d+\sde\s\d+$', text): continue
+                    # BLOQUEIO CRÍTICO: Se a palavra ou frase estiver na blacklist, ignora o processamento dela
+                    if any(word in text_lower for word in self.blacklist):
+                        continue
+                    if re.match(r'^\d+\sde\s\d+$', text): # Ignora "1 de 11", "2 de 11", etc.
+                        continue
 
                     # 1. Detecta Data
                     if self.date_pattern.match(text):
@@ -50,25 +55,24 @@ class NubankUltraParser:
                         last_y = 0
                     
                     elif current_tx:
-                        # 2. Detecta Valor (Coluna Direita)
+                        # 2. Detecta Valor Individual (Coluna Direita)
                         if ',' in text and any(c.isdigit() for c in text) and x0 > 400:
-                            # CORREÇÃO CRUCIAL: Só aceita se for uma nova linha vertical (y0 diferente de last_y)
+                            # Só processa se não for na mesma altura (Y) do valor anterior (evita ler agência como valor)
                             if abs(y0 - last_y) > 5: 
                                 val = self.clean_val(text)
                                 
-                                # Se a transação já tem valor e mudou a altura, abre uma nova
                                 if (current_tx["Entrada"] > 0 or current_tx["Saida"] > 0):
                                     extracted_rows.append(current_tx)
                                     current_tx = {"Data": last_seen_date, "Historico": "", "Entrada": 0.0, "Saida": 0.0, "Pagina": page.page_number}
                                 
-                                # Classifica
+                                # Classifica baseado no histórico acumulado até agora
                                 h_low = current_tx["Historico"].lower()
                                 if any(x in h_low for x in ["pagamento", "compra", "enviada", "saída", "débito", "fatura"]):
                                     current_tx["Saida"] = val
                                 else:
                                     current_tx["Entrada"] = val
                                 
-                                last_y = y0 # Registra a altura onde o valor foi encontrado
+                                last_y = y0 
                         else:
                             # 3. Acumula Histórico
                             if len(text) > 1:
@@ -82,8 +86,9 @@ class NubankUltraParser:
         df = pd.DataFrame(rows)
         if df.empty: return df
         df['Historico'] = df['Historico'].astype(str).str.strip()
+        # Garante que não fiquem linhas vazias ou apenas com espaços
         df = df[df['Historico'].str.len() > 2]
-        # Limpeza final de duplicatas residuais
+        # Drop de duplicatas residuais por segurança
         df = df.drop_duplicates(subset=['Data', 'Historico', 'Entrada', 'Saida'])
         return df[["Data", "Historico", "Entrada", "Saida", "Pagina"]]
 
