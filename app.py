@@ -8,6 +8,7 @@ st.set_page_config(page_title="Conversor Profissional - Vitor", layout="wide")
 
 class NubankUltraParser:
     def __init__(self):
+        # Regex para datas: "02 OUT 2025" ou "02 OUT" [cite: 11, 24]
         self.date_pattern = re.compile(r'^\d{2}\s[A-Z]{3}')
         self.blacklist = [
             "atendimento", "ouvidoria", "mande uma mensagem", "duvida", "ligue", 
@@ -17,7 +18,7 @@ class NubankUltraParser:
 
     def clean_val(self, val_str):
         if not val_str: return 0.0
-        clean = re.sub(r'[^0-9,\.]', '', str(val_str)) # Remove tudo exceto números e pontuação
+        clean = re.sub(r'[^0-9,\.]', '', str(val_str))
         if ',' in clean:
             clean = clean.replace('.', '').replace(',', '.')
         try: 
@@ -28,6 +29,7 @@ class NubankUltraParser:
         extracted_rows = []
         with pdfplumber.open(pdf_file) as pdf:
             for page in pdf.pages:
+                # Extrai palavras mantendo a noção de linha (y_tolerance) [cite: 44, 103]
                 words = page.extract_words(keep_blank_chars=True, y_tolerance=3)
                 
                 current_tx = None
@@ -41,30 +43,32 @@ class NubankUltraParser:
                     if any(word in text_lower for word in self.blacklist): continue
                     if re.match(r'^\d+\sde\s\d+$', text): continue
 
-                    # 1. Detecta Data [cite: 11, 18, 24]
+                    # 1. Detecta Data e reinicia a transação
                     if self.date_pattern.match(text):
                         last_seen_date = text
                         if current_tx: extracted_rows.append(current_tx)
                         current_tx = {"Data": last_seen_date, "Historico": "", "Entrada": 0.0, "Saida": 0.0, "Pagina": page.page_number}
                     
                     elif current_tx:
-                        # 2. Lógica de Colunas por Coordenada X 
-                        # Se o texto tem número e vírgula, verificamos a posição [cite: 12, 16, 20]
-                        if ',' in text and any(c.isdigit() for c in text):
+                        # 2. Se encontrar um valor (x0 > 400), verifica se já existe um valor na linha atual
+                        if ',' in text and any(c.isdigit() for c in text) and x0 > 400:
                             val = self.clean_val(text)
-                            # Se está muito à direita, é o valor da transação [cite: 16, 23, 29]
-                            if x0 > 450:
-                                # Se o histórico contém palavras de saída, vai para Saída [cite: 31, 32, 57]
-                                h_low = current_tx["Historico"].lower()
-                                if any(x in h_low for x in ["pagamento", "compra", "enviada", "saída", "débito", "fatura"]):
-                                    current_tx["Saida"] = val
-                                else:
-                                    current_tx["Entrada"] = val
-                            continue
-                        
-                        # 3. Acumula Histórico [cite: 13, 14, 21, 22]
-                        if len(text) > 1:
-                            current_tx["Historico"] += f" {text}"
+                            
+                            # Se a transação atual já tem um valor, salva e começa outra na mesma data
+                            if current_tx["Entrada"] > 0 or current_tx["Saida"] > 0:
+                                extracted_rows.append(current_tx)
+                                current_tx = {"Data": last_seen_date, "Historico": "", "Entrada": 0.0, "Saida": 0.0, "Pagina": page.page_number}
+                            
+                            # Classificação por histórico [cite: 31, 150]
+                            h_low = current_tx["Historico"].lower()
+                            if any(x in h_low for x in ["pagamento", "compra", "enviada", "saída", "débito", "fatura"]):
+                                current_tx["Saida"] = val
+                            else:
+                                current_tx["Entrada"] = val
+                        else:
+                            # 3. Acumula Histórico
+                            if len(text) > 1:
+                                current_tx["Historico"] += f" {text}"
                 
                 if current_tx: extracted_rows.append(current_tx)
         
@@ -74,11 +78,13 @@ class NubankUltraParser:
         df = pd.DataFrame(rows)
         if df.empty: return df
         df['Historico'] = df['Historico'].astype(str).str.strip()
-        # Filtro para remover linhas de resumo que sobraram 
-        df = df[df['Historico'].str.len() > 3]
+        # Remove linhas sem histórico útil
+        df = df[df['Historico'].str.len() > 2]
+        # Remove duplicatas exatas de leitura (mesma data, histórico e valores)
+        df = df.drop_duplicates(subset=['Data', 'Historico', 'Entrada', 'Saida'])
         return df[["Data", "Historico", "Entrada", "Saida", "Pagina"]]
 
-# --- Interface (Mantida a estrutura aprovada) ---
+# --- Interface ---
 st.title("🏦 Conversor de Extratos Profissional")
 
 if 'data' not in st.session_state: st.session_state.data = None
